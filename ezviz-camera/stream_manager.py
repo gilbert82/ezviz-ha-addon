@@ -70,8 +70,9 @@ class StreamManager:
                 '-fflags', '+discardcorrupt+genpts',
                 '-analyzeduration', '10000000',
                 '-probesize', '5000000',
+                '-f', 'hevc',
                 '-c:v', 'hevc',
-                '-strict', '-1',
+                '-strict', 'experimental',
                 '-i', 'pipe:0',
                 '-c:v', 'libx264',
                 '-preset', 'ultrafast',
@@ -314,7 +315,7 @@ if __name__ == '__main__':
     parser.add_argument('--hls-time', type=int, default=2)
     parser.add_argument('--hls-list-size', type=int, default=10)
     parser.add_argument('--idle-timeout', type=int, default=30)
-
+h
     args = parser.parse_args()
 
     run_on_demand_server(
