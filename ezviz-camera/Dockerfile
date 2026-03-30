@@ -26,6 +26,7 @@ COPY ezviz_stream.py .
 COPY stream_to_pipe.py .
 COPY http_server.py .
 COPY stream_manager.py .
+COPY hevc_filter.py .
 COPY run.sh .
 
 # Fix line endings and make run script executable
