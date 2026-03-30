@@ -105,6 +105,7 @@ def stream_to_pipe(email, password, serial, pipe_path, region="Europe"):
 
         # Stream loop - write to stdout (which will be piped)
         packet_count = 0
+        total_packets = 0
         while True:
             # Read packet header
             header = sock.recv(8)
@@ -127,6 +128,10 @@ def stream_to_pipe(email, password, serial, pipe_path, region="Europe"):
                     break
                 data += chunk
                 remaining -= len(chunk)
+
+            total_packets += 1
+            if total_packets <= 10 or total_packets % 50 == 0:
+                print(f"PKT #{total_packets}: ch=0x{channel:02x} len={len(data)} magic=0x{magic:02x} msg=0x{msg_code:04x}", file=sys.stderr)
 
             # Send stream data to stdout (channel 0x01 = unencrypted stream)
             if channel == 0x01 and len(data) > 0:
