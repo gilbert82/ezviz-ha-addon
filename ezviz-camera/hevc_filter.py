@@ -65,20 +65,21 @@ def ensure_4byte_sc(nal_with_sc, sc_len):
     return bytearray(b'\x00') + nal_with_sc
 
 
-# Pre-built minimal valid VPS NAL for HEVC Main profile, Level 4.0
-# Structure: 4-byte start code + 2-byte NAL header + VPS RBSP
-# VPS: id=0, 1 layer, 1 sub-layer, Main profile, Level 4.0
+# Pre-built valid VPS NAL for HEVC Main profile, Level 4.0
+# MUST have max_sub_layers_minus1=3 to match the EZVIZ SPS
+# (SPS has max_sub_layers=3, changing it would shift all VLC-coded fields)
 _REPLACEMENT_VPS = bytearray(
     b'\x00\x00\x00\x01'  # 4-byte start code
     b'\x40\x01'          # NAL header: type=32 (VPS), layer_id=0, tid=1
-    b'\x0c\x01'          # vps_id=0, reserved_3=3, max_layers=0, max_sub=0, nesting=1
+    b'\x0c\x07'          # vps_id=0, reserved_3=3, max_layers=0, max_sub=3, nesting=1
     b'\xff\xff'          # reserved_0xffff
     b'\x01'              # PTL: profile_space=0, tier=0, profile_idc=1 (Main)
     b'\x60\x00\x00\x00' # profile_compat: Main + Main10 bits set
     b'\xb0'              # progressive=1, interlaced=0, non_packed=1, frame_only=1
     b'\x00\x00\x00\x00\x00'  # constraint flags (zeros)
     b'\x78'              # level_idc=120 (Level 4.0)
-    b'\xf0\x24'          # sub_layer_ordering + trailing bits
+    b'\x00\x00'          # sub_layer flags: all 0 (no sub-layer PTL data)
+    b'\x17\x02\x40'      # ordering_info + max_layer + trailing bits
 )
 
 
@@ -93,16 +94,19 @@ def replace_vps(nal_data, sc_len):
     return bytearray(_REPLACEMENT_VPS), True
 
 
-def patch_sps_profile(nal_data, sc_len):
-    """Patch SPS to use a standard HEVC profile that FFmpeg accepts.
+def patch_sps(nal_data, sc_len):
+    """Patch SPS to reference VPS 0 and use Main profile.
 
     SPS RBSP layout (after 2-byte NAL header):
       Byte 0: sps_video_parameter_set_id(4) | sps_max_sub_layers_minus1(3) | temporal_nesting(1)
-      Byte 1+: profile_tier_level structure:
-        Byte 1: general_profile_space(2) | general_tier_flag(1) | general_profile_idc(5)
+      Byte 1: general_profile_space(2) | general_tier_flag(1) | general_profile_idc(5)
+      ...
 
-    EZVIZ sends profile_idc=31 ('Unknown HEVC profile: 31'), which FFmpeg
-    cannot decode. We patch it to Main profile (1).
+    We ONLY change:
+    - sps_video_parameter_set_id to 0 (match our replacement VPS)
+    - general_profile_idc to 1 (Main)
+    We do NOT touch max_sub_layers_minus1 or anything else, because
+    changing it would shift all VLC-coded fields that follow the PTL.
     """
     rbsp_start = sc_len + 2  # skip start code + 2-byte NAL header
     if len(nal_data) < rbsp_start + 2:
@@ -110,20 +114,18 @@ def patch_sps_profile(nal_data, sc_len):
 
     patched = False
 
-    # Fix SPS VPS reference: set sps_video_parameter_set_id to 0
-    # RBSP byte 0 bits [7:4] = sps_vps_id
+    # Fix sps_video_parameter_set_id to 0 (bits [7:4] of RBSP byte 0)
     byte0 = nal_data[rbsp_start]
     sps_vps_id = (byte0 >> 4) & 0x0F
     if sps_vps_id != 0:
-        nal_data[rbsp_start] = (byte0 & 0x0F) | (0 << 4)
+        nal_data[rbsp_start] = byte0 & 0x0F  # clear upper 4 bits
         patched = True
 
-    # Fix general_profile_idc in PTL structure
-    # PTL starts at RBSP byte 1 for SPS
+    # Fix general_profile_idc to Main (1) in PTL byte 0
     ptl_byte = nal_data[rbsp_start + 1]
     profile_idc = ptl_byte & 0x1F
-    if profile_idc != 1:  # Not Main profile
-        nal_data[rbsp_start + 1] = (ptl_byte & 0xE0) | 1  # Set to Main profile
+    if profile_idc != 1:
+        nal_data[rbsp_start + 1] = (ptl_byte & 0xE0) | 1
         patched = True
 
     return nal_data, patched
@@ -244,11 +246,11 @@ def filter_hevc_stream():
                     if chunk_count <= 5:
                         print(f"Cached VPS ({len(last_vps)} bytes)", file=sys.stderr)
                 elif nal_type == NAL_SPS:
-                    normalized, was_patched = patch_sps_profile(normalized, 4)
+                    normalized, was_patched = patch_sps(normalized, 4)
                     if was_patched and chunk_count <= 10:
                         print(
-                            f"Patched SPS profile/VPS-ref "
-                            f"(bytes: {normalized[4:10].hex()})",
+                            f"Patched SPS vps_id=0, profile=Main "
+                            f"(header: {normalized[6:8].hex()})",
                             file=sys.stderr,
                         )
                     last_sps = bytearray(normalized)
