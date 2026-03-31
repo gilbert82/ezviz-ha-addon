@@ -75,10 +75,12 @@ class StreamManager:
                 '-strict', '-2',
                 '-i', 'pipe:0',
                 '-c:v', 'copy',
+                '-tag:v', 'hvc1',
                 '-f', 'hls',
                 '-hls_time', str(self.hls_time),
                 '-hls_list_size', str(self.hls_list_size),
                 '-hls_flags', 'append_list+omit_endlist+discont_start',
+                '-hls_segment_type', 'mpegts',
                 '-hls_segment_filename', str(self.hls_dir / f'seg_{session_id}_%03d.ts'),
                 str(self.hls_dir / 'stream.m3u8')
             ]

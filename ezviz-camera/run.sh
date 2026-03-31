@@ -116,10 +116,12 @@ while true; do
         -strict -2 \
         -i pipe:0 \
         -c:v copy \
+        -tag:v hvc1 \
         -f hls \
         -hls_time "${HLS_TIME}" \
         -hls_list_size "${HLS_LIST_SIZE}" \
         -hls_flags append_list+omit_endlist+discont_start \
+        -hls_segment_type mpegts \
         -hls_segment_filename "/share/ezviz_hls/seg_${SESSION_ID}_%03d.ts" \
         /share/ezviz_hls/stream.m3u8 2>&1 || true
 
