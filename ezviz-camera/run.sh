@@ -108,9 +108,10 @@ while true; do
     python3 -u /app/hevc_filter.py | \
     ffmpeg -hide_banner -loglevel warning \
         -err_detect ignore_err \
-        -fflags +discardcorrupt+genpts \
-        -analyzeduration 10000000 \
-        -probesize 5000000 \
+        -fflags +discardcorrupt+genpts+nobuffer \
+        -flags low_delay \
+        -analyzeduration 20000000 \
+        -probesize 10000000 \
         -f hevc \
         -strict -1 \
         -i pipe:0 \
@@ -119,7 +120,7 @@ while true; do
         -tune zerolatency \
         -pix_fmt yuv420p \
         -crf 23 \
-        -g 30 \
+        -g 15 \
         -f hls \
         -hls_time "${HLS_TIME}" \
         -hls_list_size "${HLS_LIST_SIZE}" \
