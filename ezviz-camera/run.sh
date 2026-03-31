@@ -97,9 +97,11 @@ while true; do
     # Unique segment prefix per session to avoid overwrites during reconnect
     SESSION_ID="${TIMESTAMP}_${RESTART_COUNT}"
 
-    # Start streaming pipeline: Python > HEVC filter > ffmpeg > HLS
-    # The HEVC filter strips proprietary NAL units from EZVIZ non-standard H.265
-    # || true ensures the loop continues even if ffmpeg exits with error
+    # Two-stage streaming pipeline:
+    #   Python -> HEVC filter -> FFmpeg mux (hevc copy to mpegts) -> FFmpeg transcode (h264 HLS)
+    # Stage 1 muxes raw non-standard HEVC into MPEG-TS with -c:v copy (no decoding needed).
+    # Stage 2 reads the MPEG-TS and transcodes to H.264 HLS for browser compatibility.
+    # || true ensures the loop continues even if ffmpeg exits with error.
     python3 -u /app/stream_to_pipe.py \
         --email "${EMAIL}" \
         --password "${PASSWORD}" \
@@ -109,19 +111,30 @@ while true; do
     ffmpeg -hide_banner -loglevel warning \
         -err_detect ignore_err \
         -fflags +discardcorrupt+genpts+nobuffer \
-        -flags low_delay \
         -analyzeduration 30000000 \
         -probesize 15000000 \
         -f hevc \
         -strict -2 \
         -i pipe:0 \
         -c:v copy \
-        -tag:v hvc1 \
+        -f mpegts \
+        pipe:1 | \
+    ffmpeg -hide_banner -loglevel warning \
+        -err_detect ignore_err \
+        -fflags +discardcorrupt+genpts+nobuffer \
+        -flags low_delay \
+        -f mpegts \
+        -i pipe:0 \
+        -c:v libx264 \
+        -preset ultrafast \
+        -tune zerolatency \
+        -pix_fmt yuv420p \
+        -crf 23 \
+        -g 15 \
         -f hls \
         -hls_time "${HLS_TIME}" \
         -hls_list_size "${HLS_LIST_SIZE}" \
         -hls_flags append_list+omit_endlist+discont_start \
-        -hls_segment_type mpegts \
         -hls_segment_filename "/share/ezviz_hls/seg_${SESSION_ID}_%03d.ts" \
         /share/ezviz_hls/stream.m3u8 2>&1 || true
 

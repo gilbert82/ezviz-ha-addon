@@ -32,6 +32,9 @@ class StreamManager:
         self.idle_timeout = idle_timeout
 
         self.process = None
+        self._python_proc = None
+        self._filter_proc = None
+        self._mux_proc = None
         self.last_activity = 0
         self.restart_count = 0
         self.lock = threading.Lock()
@@ -64,28 +67,47 @@ class StreamManager:
                 'python3', '-u', '/app/hevc_filter.py'
             ]
 
-            ffmpeg_cmd = [
+            # Two-stage pipeline: first mux raw HEVC into MPEG-TS (this works
+            # even with non-standard HEVC), then transcode TS to H.264 HLS.
+            # Stage 1: hevc annexB -> mpegts (copy, no decoding)
+            mux_cmd = [
                 'ffmpeg', '-hide_banner', '-loglevel', 'warning',
                 '-err_detect', 'ignore_err',
                 '-fflags', '+discardcorrupt+genpts+nobuffer',
-                '-flags', 'low_delay',
                 '-analyzeduration', '30000000',
                 '-probesize', '15000000',
                 '-f', 'hevc',
                 '-strict', '-2',
                 '-i', 'pipe:0',
                 '-c:v', 'copy',
-                '-tag:v', 'hvc1',
+                '-f', 'mpegts',
+                'pipe:1',
+            ]
+
+            # Stage 2: mpegts -> h264 HLS (transcode)
+            ffmpeg_cmd = [
+                'ffmpeg', '-hide_banner', '-loglevel', 'warning',
+                '-err_detect', 'ignore_err',
+                '-fflags', '+discardcorrupt+genpts+nobuffer',
+                '-flags', 'low_delay',
+                '-f', 'mpegts',
+                '-i', 'pipe:0',
+                '-c:v', 'libx264',
+                '-preset', 'ultrafast',
+                '-tune', 'zerolatency',
+                '-pix_fmt', 'yuv420p',
+                '-crf', '23',
+                '-g', '15',
                 '-f', 'hls',
                 '-hls_time', str(self.hls_time),
                 '-hls_list_size', str(self.hls_list_size),
                 '-hls_flags', 'append_list+omit_endlist+discont_start',
-                '-hls_segment_type', 'mpegts',
                 '-hls_segment_filename', str(self.hls_dir / f'seg_{session_id}_%03d.ts'),
                 str(self.hls_dir / 'stream.m3u8')
             ]
 
-            # Start pipeline: python > hevc_filter > ffmpeg
+            # Start 4-stage pipeline:
+            #   python -> hevc_filter -> mux (hevc copy to mpegts) -> transcode (h264 HLS)
             python_proc = subprocess.Popen(
                 python_cmd,
                 stdout=subprocess.PIPE,
@@ -99,16 +121,30 @@ class StreamManager:
                 stderr=sys.stderr
             )
 
-            self.process = subprocess.Popen(
-                ffmpeg_cmd,
+            mux_proc = subprocess.Popen(
+                mux_cmd,
                 stdin=filter_proc.stdout,
                 stdout=subprocess.PIPE,
                 stderr=sys.stderr
             )
 
+            transcode_proc = subprocess.Popen(
+                ffmpeg_cmd,
+                stdin=mux_proc.stdout,
+                stdout=subprocess.PIPE,
+                stderr=sys.stderr
+            )
+
+            # Allow SIGPIPE propagation
+            python_proc.stdout.close()
+            filter_proc.stdout.close()
+            mux_proc.stdout.close()
+
             # Store references for cleanup
             self._python_proc = python_proc
             self._filter_proc = filter_proc
+            self._mux_proc = mux_proc
+            self.process = transcode_proc
 
             self.running = True
             self.last_activity = time.time()
@@ -130,31 +166,23 @@ class StreamManager:
             print("Stopping stream (idle timeout)...", file=sys.stderr)
             self.running = False
 
-            # Terminate processes (in reverse order)
-            if hasattr(self, '_python_proc') and self._python_proc:
-                try:
-                    self._python_proc.terminate()
-                    self._python_proc.wait(timeout=5)
-                except:
-                    self._python_proc.kill()
-
-            if hasattr(self, '_filter_proc') and self._filter_proc:
-                try:
-                    self._filter_proc.terminate()
-                    self._filter_proc.wait(timeout=5)
-                except:
-                    self._filter_proc.kill()
-
-            if self.process:
-                try:
-                    self.process.terminate()
-                    self.process.wait(timeout=5)
-                except:
-                    self.process.kill()
+            # Terminate processes (in reverse order: transcode, mux, filter, python)
+            for attr in ('process', '_mux_proc', '_filter_proc', '_python_proc'):
+                proc = getattr(self, attr, None)
+                if proc:
+                    try:
+                        proc.terminate()
+                        proc.wait(timeout=5)
+                    except:
+                        try:
+                            proc.kill()
+                        except:
+                            pass
 
             self.process = None
-            self._python_proc = None
+            self._mux_proc = None
             self._filter_proc = None
+            self._python_proc = None
 
     def touch_activity(self):
         """Update last activity timestamp"""
