@@ -8,13 +8,10 @@ with non-standard NAL unit types that cause ffmpeg to fail.
 This filter:
 1. Strip any data before the first valid HEVC start code (proprietary preamble)
 2. Strip NAL units with type > 40 (proprietary, e.g. type 48)
-3. Patch VPS reserved fields (reserved_three_2bits -> 3, reserved_0xffff -> 0xFFFF)
-   so FFmpeg can parse the stream for decoding/transcoding
-4. Cache and re-inject VPS/SPS/PPS before IDR frames
-
-The VPS patching is minimal and targeted: only the reserved fields that
-FFmpeg strictly validates are corrected. Profile/tier/level bytes are NOT
-touched - FFmpeg handles non-standard profiles with -strict -2.
+3. Replace entire VPS with a valid Main profile VPS (EZVIZ VPS is too
+   non-standard to patch - bogus vps_id, layers, reserved fields, profile)
+4. Patch SPS to reference VPS 0 and use Main profile
+5. Cache and re-inject VPS/SPS/PPS before IDR frames
 """
 
 import sys
@@ -68,37 +65,65 @@ def ensure_4byte_sc(nal_with_sc, sc_len):
     return bytearray(b'\x00') + nal_with_sc
 
 
-def patch_vps(nal_data, sc_len):
-    """Fix non-standard VPS fields so FFmpeg accepts the stream.
+# Pre-built minimal valid VPS NAL for HEVC Main profile, Level 4.0
+# Structure: 4-byte start code + 2-byte NAL header + VPS RBSP
+# VPS: id=0, 1 layer, 1 sub-layer, Main profile, Level 4.0
+_REPLACEMENT_VPS = bytearray(
+    b'\x00\x00\x00\x01'  # 4-byte start code
+    b'\x40\x01'          # NAL header: type=32 (VPS), layer_id=0, tid=1
+    b'\x0c\x01'          # vps_id=0, reserved_3=3, max_layers=0, max_sub=0, nesting=1
+    b'\xff\xff'          # reserved_0xffff
+    b'\x01'              # PTL: profile_space=0, tier=0, profile_idc=1 (Main)
+    b'\x60\x00\x00\x00' # profile_compat: Main + Main10 bits set
+    b'\xb0'              # progressive=1, interlaced=0, non_packed=1, frame_only=1
+    b'\x00\x00\x00\x00\x00'  # constraint flags (zeros)
+    b'\x78'              # level_idc=120 (Level 4.0)
+    b'\xf0\x24'          # sub_layer_ordering + trailing bits
+)
 
-    HEVC VPS RBSP layout (after 2-byte NAL header):
-      Byte 0: vps_id(4) | reserved_three_2bits(2) | max_layers_minus1[5:4](2)
-      Byte 1: max_layers_minus1[3:0](4) | max_sub_layers_minus1(3) | temporal_nesting(1)
-      Byte 2-3: reserved_0xffff_16bits (must be 0xFFFF)
-      Byte 4+: profile_tier_level ...
 
-    EZVIZ cameras set reserved_three_2bits to non-3 values which causes:
-      'vps_reserved_three_2bits is not three'
-    and reserved_0xffff_16bits to non-0xFFFF which causes:
-      'VPS 0 does not exist'
+def replace_vps(nal_data, sc_len):
+    """Replace the entire VPS NAL with a valid minimal VPS.
+
+    EZVIZ cameras send a heavily non-standard VPS with bogus values
+    for nearly every field. Rather than patching individual fields
+    (which can leave inconsistencies), we replace the entire VPS
+    with a pre-built valid one for HEVC Main profile, Level 4.0.
+    """
+    return bytearray(_REPLACEMENT_VPS), True
+
+
+def patch_sps_profile(nal_data, sc_len):
+    """Patch SPS to use a standard HEVC profile that FFmpeg accepts.
+
+    SPS RBSP layout (after 2-byte NAL header):
+      Byte 0: sps_video_parameter_set_id(4) | sps_max_sub_layers_minus1(3) | temporal_nesting(1)
+      Byte 1+: profile_tier_level structure:
+        Byte 1: general_profile_space(2) | general_tier_flag(1) | general_profile_idc(5)
+
+    EZVIZ sends profile_idc=31 ('Unknown HEVC profile: 31'), which FFmpeg
+    cannot decode. We patch it to Main profile (1).
     """
     rbsp_start = sc_len + 2  # skip start code + 2-byte NAL header
-    if len(nal_data) < rbsp_start + 4:
+    if len(nal_data) < rbsp_start + 2:
         return nal_data, False
 
     patched = False
 
-    # Fix reserved_three_2bits: bits [3:2] of RBSP byte 0 must be 0b11
+    # Fix SPS VPS reference: set sps_video_parameter_set_id to 0
+    # RBSP byte 0 bits [7:4] = sps_vps_id
     byte0 = nal_data[rbsp_start]
-    current_reserved = (byte0 >> 2) & 0x03
-    if current_reserved != 3:
-        nal_data[rbsp_start] = (byte0 & 0xF3) | (3 << 2)
+    sps_vps_id = (byte0 >> 4) & 0x0F
+    if sps_vps_id != 0:
+        nal_data[rbsp_start] = (byte0 & 0x0F) | (0 << 4)
         patched = True
 
-    # Fix reserved_0xffff_16bits: RBSP bytes 2-3 must be 0xFF 0xFF
-    if nal_data[rbsp_start + 2] != 0xFF or nal_data[rbsp_start + 3] != 0xFF:
-        nal_data[rbsp_start + 2] = 0xFF
-        nal_data[rbsp_start + 3] = 0xFF
+    # Fix general_profile_idc in PTL structure
+    # PTL starts at RBSP byte 1 for SPS
+    ptl_byte = nal_data[rbsp_start + 1]
+    profile_idc = ptl_byte & 0x1F
+    if profile_idc != 1:  # Not Main profile
+        nal_data[rbsp_start + 1] = (ptl_byte & 0xE0) | 1  # Set to Main profile
         patched = True
 
     return nal_data, patched
@@ -208,17 +233,24 @@ def filter_hevc_stream():
                 normalized = ensure_4byte_sc(nal_with_sc, sc_len)
 
                 if nal_type == NAL_VPS:
-                    normalized, was_patched = patch_vps(normalized, 4)
-                    if was_patched and chunk_count <= 10:
+                    normalized, was_replaced = replace_vps(normalized, 4)
+                    if was_replaced and chunk_count <= 10:
                         print(
-                            f"Patched VPS reserved fields "
-                            f"(bytes: {normalized[4:10].hex()})",
+                            f"Replaced VPS with standard Main profile "
+                            f"({len(normalized)} bytes)",
                             file=sys.stderr,
                         )
                     last_vps = bytearray(normalized)
                     if chunk_count <= 5:
                         print(f"Cached VPS ({len(last_vps)} bytes)", file=sys.stderr)
                 elif nal_type == NAL_SPS:
+                    normalized, was_patched = patch_sps_profile(normalized, 4)
+                    if was_patched and chunk_count <= 10:
+                        print(
+                            f"Patched SPS profile/VPS-ref "
+                            f"(bytes: {normalized[4:10].hex()})",
+                            file=sys.stderr,
+                        )
                     last_sps = bytearray(normalized)
                     if chunk_count <= 5:
                         print(f"Cached SPS ({len(last_sps)} bytes)", file=sys.stderr)
