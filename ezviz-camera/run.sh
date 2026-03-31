@@ -110,10 +110,10 @@ while true; do
         -err_detect ignore_err \
         -fflags +discardcorrupt+genpts+nobuffer \
         -flags low_delay \
-        -analyzeduration 20000000 \
-        -probesize 10000000 \
+        -analyzeduration 30000000 \
+        -probesize 15000000 \
         -f hevc \
-        -strict -1 \
+        -strict -2 \
         -i pipe:0 \
         -c:v libx264 \
         -preset ultrafast \
