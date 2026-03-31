@@ -30,7 +30,7 @@ COPY hevc_filter.py .
 COPY run.sh .
 
 # Fix line endings and make run script executable
-RUN dos2unix run.sh && chmod a+x run.sh
+RUN dos2unix run.sh *.py && chmod a+x run.sh
 
 # Run the application
 CMD [ "/app/run.sh" ]
