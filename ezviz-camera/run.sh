@@ -115,12 +115,7 @@ while true; do
         -f hevc \
         -strict -2 \
         -i pipe:0 \
-        -c:v libx264 \
-        -preset ultrafast \
-        -tune zerolatency \
-        -pix_fmt yuv420p \
-        -crf 23 \
-        -g 15 \
+        -c:v copy \
         -f hls \
         -hls_time "${HLS_TIME}" \
         -hls_list_size "${HLS_LIST_SIZE}" \
