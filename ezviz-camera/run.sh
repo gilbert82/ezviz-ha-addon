@@ -97,10 +97,9 @@ while true; do
     # Unique segment prefix per session to avoid overwrites during reconnect
     SESSION_ID="${TIMESTAMP}_${RESTART_COUNT}"
 
-    # Two-stage streaming pipeline:
-    #   Python -> HEVC filter -> FFmpeg mux (hevc copy to mpegts) -> FFmpeg transcode (h264 HLS)
-    # Stage 1 muxes raw non-standard HEVC into MPEG-TS with -c:v copy (no decoding needed).
-    # Stage 2 reads the MPEG-TS and transcodes to H.264 HLS for browser compatibility.
+    # Single-stage pipeline: Python -> HEVC filter -> FFmpeg (HEVC decode -> H.264 HLS)
+    # The HEVC filter patches VPS reserved fields so FFmpeg can decode the stream,
+    # then FFmpeg transcodes HEVC to H.264 for universal browser compatibility.
     # || true ensures the loop continues even if ffmpeg exits with error.
     python3 -u /app/stream_to_pipe.py \
         --email "${EMAIL}" \
@@ -111,19 +110,11 @@ while true; do
     ffmpeg -hide_banner -loglevel warning \
         -err_detect ignore_err \
         -fflags +discardcorrupt+genpts+nobuffer \
+        -flags low_delay \
         -analyzeduration 30000000 \
         -probesize 15000000 \
         -f hevc \
         -strict -2 \
-        -i pipe:0 \
-        -c:v copy \
-        -f mpegts \
-        pipe:1 | \
-    ffmpeg -hide_banner -loglevel warning \
-        -err_detect ignore_err \
-        -fflags +discardcorrupt+genpts+nobuffer \
-        -flags low_delay \
-        -f mpegts \
         -i pipe:0 \
         -c:v libx264 \
         -preset ultrafast \

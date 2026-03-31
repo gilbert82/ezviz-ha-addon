@@ -5,15 +5,16 @@ HEVC NAL unit filter for EZVIZ proprietary H.265 streams.
 The EZVIZ HP2 (and possibly other models) use a proprietary H.265 variant
 with non-standard NAL unit types that cause ffmpeg to fail.
 
-This filter takes a SIMPLE approach:
+This filter:
 1. Strip any data before the first valid HEVC start code (proprietary preamble)
 2. Strip NAL units with type > 40 (proprietary, e.g. type 48)
-3. Pass everything else through UNCHANGED - no patching of VPS/SPS/PPS
+3. Patch VPS reserved fields (reserved_three_2bits -> 3, reserved_0xffff -> 0xFFFF)
+   so FFmpeg can parse the stream for decoding/transcoding
 4. Cache and re-inject VPS/SPS/PPS before IDR frames
 
-Previous versions tried to patch VPS/SPS profile bytes, but this corrupted
-the 'vps_reserved_three_2bits' field. FFmpeg with -strict -1 handles
-non-standard profiles fine - we just need clean NAL units.
+The VPS patching is minimal and targeted: only the reserved fields that
+FFmpeg strictly validates are corrected. Profile/tier/level bytes are NOT
+touched - FFmpeg handles non-standard profiles with -strict -2.
 """
 
 import sys
@@ -65,6 +66,42 @@ def ensure_4byte_sc(nal_with_sc, sc_len):
     if sc_len == 4:
         return nal_with_sc
     return bytearray(b'\x00') + nal_with_sc
+
+
+def patch_vps(nal_data, sc_len):
+    """Fix non-standard VPS fields so FFmpeg accepts the stream.
+
+    HEVC VPS RBSP layout (after 2-byte NAL header):
+      Byte 0: vps_id(4) | reserved_three_2bits(2) | max_layers_minus1[5:4](2)
+      Byte 1: max_layers_minus1[3:0](4) | max_sub_layers_minus1(3) | temporal_nesting(1)
+      Byte 2-3: reserved_0xffff_16bits (must be 0xFFFF)
+      Byte 4+: profile_tier_level ...
+
+    EZVIZ cameras set reserved_three_2bits to non-3 values which causes:
+      'vps_reserved_three_2bits is not three'
+    and reserved_0xffff_16bits to non-0xFFFF which causes:
+      'VPS 0 does not exist'
+    """
+    rbsp_start = sc_len + 2  # skip start code + 2-byte NAL header
+    if len(nal_data) < rbsp_start + 4:
+        return nal_data, False
+
+    patched = False
+
+    # Fix reserved_three_2bits: bits [3:2] of RBSP byte 0 must be 0b11
+    byte0 = nal_data[rbsp_start]
+    current_reserved = (byte0 >> 2) & 0x03
+    if current_reserved != 3:
+        nal_data[rbsp_start] = (byte0 & 0xF3) | (3 << 2)
+        patched = True
+
+    # Fix reserved_0xffff_16bits: RBSP bytes 2-3 must be 0xFF 0xFF
+    if nal_data[rbsp_start + 2] != 0xFF or nal_data[rbsp_start + 3] != 0xFF:
+        nal_data[rbsp_start + 2] = 0xFF
+        nal_data[rbsp_start + 3] = 0xFF
+        patched = True
+
+    return nal_data, patched
 
 
 def filter_hevc_stream():
@@ -167,10 +204,17 @@ def filter_hevc_stream():
                         )
                     continue
 
-                # Cache parameter sets (keep original bytes, no patching!)
+                # Normalize to 4-byte start code and patch VPS if needed
                 normalized = ensure_4byte_sc(nal_with_sc, sc_len)
 
                 if nal_type == NAL_VPS:
+                    normalized, was_patched = patch_vps(normalized, 4)
+                    if was_patched and chunk_count <= 10:
+                        print(
+                            f"Patched VPS reserved fields "
+                            f"(bytes: {normalized[4:10].hex()})",
+                            file=sys.stderr,
+                        )
                     last_vps = bytearray(normalized)
                     if chunk_count <= 5:
                         print(f"Cached VPS ({len(last_vps)} bytes)", file=sys.stderr)

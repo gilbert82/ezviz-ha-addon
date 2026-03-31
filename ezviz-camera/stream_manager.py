@@ -67,30 +67,18 @@ class StreamManager:
                 'python3', '-u', '/app/hevc_filter.py'
             ]
 
-            # Two-stage pipeline: first mux raw HEVC into MPEG-TS (this works
-            # even with non-standard HEVC), then transcode TS to H.264 HLS.
-            # Stage 1: hevc annexB -> mpegts (copy, no decoding)
-            mux_cmd = [
-                'ffmpeg', '-hide_banner', '-loglevel', 'warning',
-                '-err_detect', 'ignore_err',
-                '-fflags', '+discardcorrupt+genpts+nobuffer',
-                '-analyzeduration', '30000000',
-                '-probesize', '15000000',
-                '-f', 'hevc',
-                '-strict', '-2',
-                '-i', 'pipe:0',
-                '-c:v', 'copy',
-                '-f', 'mpegts',
-                'pipe:1',
-            ]
-
-            # Stage 2: mpegts -> h264 HLS (transcode)
+            # Single-stage pipeline: HEVC decode -> H.264 encode -> HLS
+            # The HEVC filter patches VPS reserved fields so FFmpeg can
+            # parse the non-standard EZVIZ HEVC stream for decoding.
             ffmpeg_cmd = [
                 'ffmpeg', '-hide_banner', '-loglevel', 'warning',
                 '-err_detect', 'ignore_err',
                 '-fflags', '+discardcorrupt+genpts+nobuffer',
                 '-flags', 'low_delay',
-                '-f', 'mpegts',
+                '-analyzeduration', '30000000',
+                '-probesize', '15000000',
+                '-f', 'hevc',
+                '-strict', '-2',
                 '-i', 'pipe:0',
                 '-c:v', 'libx264',
                 '-preset', 'ultrafast',
@@ -106,8 +94,7 @@ class StreamManager:
                 str(self.hls_dir / 'stream.m3u8')
             ]
 
-            # Start 4-stage pipeline:
-            #   python -> hevc_filter -> mux (hevc copy to mpegts) -> transcode (h264 HLS)
+            # Start pipeline: python -> hevc_filter -> ffmpeg
             python_proc = subprocess.Popen(
                 python_cmd,
                 stdout=subprocess.PIPE,
@@ -121,16 +108,9 @@ class StreamManager:
                 stderr=sys.stderr
             )
 
-            mux_proc = subprocess.Popen(
-                mux_cmd,
-                stdin=filter_proc.stdout,
-                stdout=subprocess.PIPE,
-                stderr=sys.stderr
-            )
-
-            transcode_proc = subprocess.Popen(
+            ffmpeg_proc = subprocess.Popen(
                 ffmpeg_cmd,
-                stdin=mux_proc.stdout,
+                stdin=filter_proc.stdout,
                 stdout=subprocess.PIPE,
                 stderr=sys.stderr
             )
@@ -138,13 +118,12 @@ class StreamManager:
             # Allow SIGPIPE propagation
             python_proc.stdout.close()
             filter_proc.stdout.close()
-            mux_proc.stdout.close()
 
             # Store references for cleanup
             self._python_proc = python_proc
             self._filter_proc = filter_proc
-            self._mux_proc = mux_proc
-            self.process = transcode_proc
+            self._mux_proc = None
+            self.process = ffmpeg_proc
 
             self.running = True
             self.last_activity = time.time()
@@ -183,6 +162,8 @@ class StreamManager:
             self._mux_proc = None
             self._filter_proc = None
             self._python_proc = None
+
+
 
     def touch_activity(self):
         """Update last activity timestamp"""
