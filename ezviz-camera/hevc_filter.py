@@ -176,6 +176,10 @@ def parse_sps_params(nal_data, sc_len):
     profile-tier-level section, because we only need the fields that
     come AFTER the PTL: resolution, chroma format, bit depth.
 
+    Uses multiple parsing strategies:
+    1. Standard-compliant PTL parsing
+    2. Brute-force search for valid resolution at different bit offsets
+
     Returns dict with: width, height, chroma_format_idc, bit_depth_luma,
                        bit_depth_chroma, max_sub_layers_minus1
     Returns None if parsing fails.
@@ -185,6 +189,14 @@ def parse_sps_params(nal_data, sc_len):
         return None
 
     rbsp = remove_ep3(nal_data[rbsp_start:])
+
+    # Log the raw SPS RBSP bytes for debugging
+    hex_dump = rbsp[:40].hex() if len(rbsp) > 40 else rbsp.hex()
+    print(
+        f"SPS RBSP ({len(rbsp)} bytes): {hex_dump}",
+        file=sys.stderr,
+    )
+
     reader = BitReader(rbsp)
 
     try:
@@ -196,6 +208,11 @@ def parse_sps_params(nal_data, sc_len):
 
         # sps_temporal_id_nesting_flag: u(1)
         nesting = reader.read(1)
+
+        print(
+            f"SPS header: vps_id={vps_id}, max_sub={max_sub}, nesting={nesting}",
+            file=sys.stderr,
+        )
 
         # profile_tier_level(1, max_sub_layers_minus1)
         # General PTL: 2+1+5 + 32 + 1+1+1+1 + 44 + 8 = 96 bits
@@ -217,6 +234,11 @@ def parse_sps_params(nal_data, sc_len):
             for i in range(max_sub, 8):
                 reader.skip(2)
 
+        print(
+            f"SPS PTL sub-layer flags: profile={sub_profile_present}, level={sub_level_present}",
+            file=sys.stderr,
+        )
+
         # Sub-layer PTL data
         for i in range(max_sub):
             if sub_profile_present[i]:
@@ -224,12 +246,72 @@ def parse_sps_params(nal_data, sc_len):
             if sub_level_present[i]:
                 reader.skip(8)
 
-        # NOW we're past the PTL section
+        pos_after_ptl = reader.pos
+        print(
+            f"SPS bit position after PTL: {pos_after_ptl}",
+            file=sys.stderr,
+        )
+
+    except Exception as e:
+        print(
+            f"SPS standard PTL parsing failed: {e}",
+            file=sys.stderr,
+        )
+        pos_after_ptl = None
+
+    # Try parsing from the position after PTL
+    result = _try_parse_sps_from_offset(rbsp, pos_after_ptl, max_sub)
+    if result:
+        return result
+
+    # Brute-force: try various bit offsets after the general PTL
+    # General PTL ends at bit 8 + 96 = 104 (without sub-layers)
+    # With sub-layer flags: 104 + max_sub*2 + (8-max_sub)*2 = 104 + 16 = 120
+    # With sub-layer data: 120 + variable
+    base_offset = 8 + 96  # SPS header (8 bits) + general PTL (96 bits)
+    if max_sub > 0:
+        base_offset += 16  # sub-layer present flags + padding = 16 bits always
+
+    print(
+        f"SPS brute-force: trying offsets from {base_offset} "
+        f"to {base_offset + 300}",
+        file=sys.stderr,
+    )
+
+    for offset in range(base_offset, min(base_offset + 300, len(rbsp) * 8 - 40)):
+        result = _try_parse_sps_from_offset(rbsp, offset, max_sub)
+        if result:
+            print(
+                f"SPS brute-force: found valid params at bit offset {offset}",
+                file=sys.stderr,
+            )
+            return result
+
+    return None
+
+
+def _try_parse_sps_from_offset(rbsp, bit_offset, max_sub):
+    """
+    Try to parse SPS fields (sps_id, chroma, width, height, etc.)
+    starting from the given bit offset.
+    Returns a params dict or None.
+    """
+    if bit_offset is None or bit_offset < 0:
+        return None
+
+    reader = BitReader(rbsp)
+    reader.pos = bit_offset
+
+    try:
         # sps_seq_parameter_set_id: ue(v)
         sps_id = reader.read_ue()
+        if sps_id > 15:
+            return None
 
         # chroma_format_idc: ue(v)
         chroma = reader.read_ue()
+        if chroma > 3:
+            return None
 
         if chroma == 3:
             reader.read(1)  # separate_colour_plane_flag
@@ -239,6 +321,13 @@ def parse_sps_params(nal_data, sc_len):
         # pic_height_in_luma_samples: ue(v)
         height = reader.read_ue()
 
+        # Sanity: valid EZVIZ camera resolutions
+        if width < 320 or width > 4096 or height < 240 or height > 3072:
+            return None
+        # Width and height should be multiples of at least 2
+        if width % 2 != 0 or height % 2 != 0:
+            return None
+
         # conformance_window_flag
         conf_win = reader.read(1)
         conf_left = conf_right = conf_top = conf_bottom = 0
@@ -247,24 +336,26 @@ def parse_sps_params(nal_data, sc_len):
             conf_right = reader.read_ue()
             conf_top = reader.read_ue()
             conf_bottom = reader.read_ue()
+            # Sanity check conformance window values
+            if conf_left > 64 or conf_right > 64:
+                return None
+            if conf_top > 64 or conf_bottom > 64:
+                return None
 
         # bit_depth_luma_minus8: ue(v)
         bd_luma = reader.read_ue()
         # bit_depth_chroma_minus8: ue(v)
         bd_chroma = reader.read_ue()
 
+        if bd_luma > 8 or bd_chroma > 8:
+            return None
+
         # log2_max_pic_order_cnt_lsb_minus4: ue(v)
         log2_poc = reader.read_ue()
-
-        # Sanity checks
-        if width < 16 or width > 8192 or height < 16 or height > 8192:
-            return None
-        if chroma > 3 or bd_luma > 8 or bd_chroma > 8:
-            return None
         if log2_poc > 12:
             return None
 
-        params = {
+        return {
             'width': width,
             'height': height,
             'chroma_format_idc': chroma,
@@ -279,8 +370,6 @@ def parse_sps_params(nal_data, sc_len):
             'conf_top': conf_top,
             'conf_bottom': conf_bottom,
         }
-
-        return params
 
     except Exception:
         return None
