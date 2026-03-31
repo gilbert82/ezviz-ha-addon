@@ -112,8 +112,7 @@ while true; do
         -analyzeduration 10000000 \
         -probesize 5000000 \
         -f hevc \
-        -c:v hevc \
-        -strict experimental \
+        -strict -1 \
         -i pipe:0 \
         -c:v libx264 \
         -preset ultrafast \
